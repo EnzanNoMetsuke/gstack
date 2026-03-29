@@ -1576,6 +1576,7 @@ describe('Codex generation (--host codex)', () => {
     // Every Codex skill should be FRESH
     for (const skill of CODEX_SKILLS) {
       expect(output).toContain(`FRESH: .agents/skills/${skill.codexName}/SKILL.md`);
+      expect(output).toContain(`FRESH: .agents/skills/${skill.codexName}/agents/openai.yaml`);
     }
     expect(output).not.toContain('STALE');
   });
