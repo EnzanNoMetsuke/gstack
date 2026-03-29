@@ -251,6 +251,7 @@ const GENERATED_HEADER = `<!-- AUTO-GENERATED from {{SOURCE}} — do not edit di
 /**
  * Process external host output: routing, frontmatter, path rewrites, metadata.
  * Shared between Codex and Factory (and future external hosts).
+ * Pure function: returns data only, does NOT write files or create directories.
  */
 function processExternalHost(
   content: string,
@@ -266,7 +267,6 @@ function processExternalHost(
 
   const name = externalSkillName(skillDir === '.' ? '' : skillDir, frontmatterName);
   const outputDir = path.join(ROOT, config.hostSubdir, 'skills', name);
-  fs.mkdirSync(outputDir, { recursive: true });
   const outputPath = path.join(outputDir, 'SKILL.md');
 
   // Guard against symlink loops
@@ -310,24 +310,20 @@ function processExternalHost(
     result = result.replace(/use the Glob tool/g, 'find files matching');
   }
 
-  // Codex-only: generate openai.yaml metadata
-  if (config.generateMetadata && !symlinkLoop) {
-    const agentsDir = path.join(outputDir, 'agents');
-    fs.mkdirSync(agentsDir, { recursive: true });
-    const shortDescription = condenseOpenAIShortDescription(extractedDescription);
-    fs.writeFileSync(path.join(agentsDir, 'openai.yaml'), generateOpenAIYaml(name, shortDescription));
-  }
-
   return { content: result, outputPath, outputDir, symlinkLoop };
 }
 
-function processTemplate(tmplPath: string, host: Host = 'claude'): { outputPath: string; content: string; symlinkLoop?: boolean } {
+type GeneratedFile = { outputPath: string; content: string };
+
+function processTemplate(tmplPath: string, host: Host = 'claude'): { files: GeneratedFile[]; symlinkLoop: boolean } {
   const tmplContent = fs.readFileSync(tmplPath, 'utf-8');
   const relTmplPath = path.relative(ROOT, tmplPath);
   let outputPath = tmplPath.replace(/\.tmpl$/, '');
 
   // Determine skill directory relative to ROOT
   const skillDir = path.relative(ROOT, path.dirname(tmplPath));
+
+  let outputDir: string | null = null;
 
   // Extract skill name from frontmatter early — needed for both TemplateContext and external host output paths.
   // When frontmatter name: differs from directory name (e.g., run-tests/ with name: test),
@@ -373,6 +369,7 @@ function processTemplate(tmplPath: string, host: Host = 'claude'): { outputPath:
     const result = processExternalHost(content, tmplContent, host, skillDir, extractedDescription, ctx, extractedName || undefined);
     content = result.content;
     outputPath = result.outputPath;
+    outputDir = result.outputDir;
     symlinkLoop = result.symlinkLoop;
   }
 
@@ -386,7 +383,22 @@ function processTemplate(tmplPath: string, host: Host = 'claude'): { outputPath:
     content = header + content;
   }
 
-  return { outputPath, content, symlinkLoop };
+  const generatedFiles: GeneratedFile[] = [{ outputPath, content }];
+
+  if (outputDir && !symlinkLoop) {
+    const config = EXTERNAL_HOST_CONFIG[host];
+    if (config?.generateMetadata) {
+      const name = externalSkillName(skillDir === '.' ? '' : skillDir, extractedName || undefined);
+      const metadataPath = path.join(outputDir, 'agents', 'openai.yaml');
+      const shortDescription = condenseOpenAIShortDescription(extractedDescription);
+      generatedFiles.push({
+        outputPath: metadataPath,
+        content: generateOpenAIYaml(name, shortDescription),
+      });
+    }
+  }
+
+  return { files: generatedFiles, symlinkLoop };
 }
 
 // ─── Main ───────────────────────────────────────────────────
@@ -413,28 +425,39 @@ for (const currentHost of hostsToRun) {
         if (dir === 'codex') continue;
       }
 
-      const { outputPath, content, symlinkLoop } = processTemplate(tmplPath, currentHost);
-      const relOutput = path.relative(ROOT, outputPath);
+      const { files, symlinkLoop } = processTemplate(tmplPath, currentHost);
+      const relSkillOutput = path.relative(ROOT, files[0].outputPath);
 
       if (symlinkLoop) {
-        console.log(`SKIPPED (symlink loop): ${relOutput}`);
-      } else if (DRY_RUN) {
-        const existing = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf-8') : '';
-        if (existing !== content) {
-          console.log(`STALE: ${relOutput}`);
-          hasChanges = true;
-        } else {
-          console.log(`FRESH: ${relOutput}`);
-        }
-      } else {
-        fs.writeFileSync(outputPath, content);
-        console.log(`GENERATED: ${relOutput}`);
+        console.log(`SKIPPED (symlink loop): ${relSkillOutput}`);
+        continue;
       }
 
-      // Track token budget
-      const lines = content.split('\n').length;
-      const tokens = Math.round(content.length / 4); // ~4 chars per token
-      tokenBudget.push({ skill: relOutput, lines, tokens });
+      for (const { outputPath, content } of files) {
+        const relOutput = path.relative(ROOT, outputPath);
+        const isSkillDoc = relOutput.endsWith('/SKILL.md') || relOutput === 'SKILL.md';
+
+        if (DRY_RUN) {
+          const existing = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf-8') : '';
+          if (existing !== content) {
+            console.log(`STALE: ${relOutput}`);
+            hasChanges = true;
+          } else {
+            console.log(`FRESH: ${relOutput}`);
+          }
+        } else {
+          fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+          fs.writeFileSync(outputPath, content);
+          console.log(`GENERATED: ${relOutput}`);
+        }
+
+        if (!isSkillDoc) continue;
+
+        // Track token budget for skill docs only, not sidecar metadata files.
+        const lines = content.split('\n').length;
+        const tokens = Math.round(content.length / 4); // ~4 chars per token
+        tokenBudget.push({ skill: relOutput, lines, tokens });
+      }
     }
 
     if (DRY_RUN && hasChanges) {
